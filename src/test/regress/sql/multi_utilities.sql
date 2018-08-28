@@ -293,5 +293,8 @@ SELECT worker_hash('(1, 2)'::test_composite_type);
 
 SELECT citus_truncate_trigger();
 
+SELECT * FROM pg_locks;
+SELECT * FROM pg_stat_activity;
+
 -- confirm that citus_create_restore_point works
 SELECT 1 FROM citus_create_restore_point('regression-test');
