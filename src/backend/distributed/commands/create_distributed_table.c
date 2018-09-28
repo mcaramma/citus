@@ -591,7 +591,7 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 		else
 		{
 			text *colocateWithTableNameText = cstring_to_text(colocateWithTableName);
-			Oid sourceRelationId = ResolveRelationId(colocateWithTableNameText);
+			Oid sourceRelationId = ResolveRelationId(colocateWithTableNameText, false);
 
 			EnsureTableCanBeColocatedWith(relationId, replicationModel,
 										  distributionColumnType, sourceRelationId);
@@ -741,14 +741,6 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("distributing partitioned tables in only supported "
 								   "for hash-distributed tables")));
-		}
-
-		/* we currently don't support  partitioned tables for replication factor > 1 */
-		if (ShardReplicationFactor > 1)
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("distributing partitioned tables with replication "
-								   "factor greater than 1 is not supported")));
 		}
 
 		/* we don't support distributing tables with multi-level partitioning */

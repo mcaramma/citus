@@ -124,10 +124,7 @@ SELECT count(1) FROM pg_dist_node WHERE nodename='localhost' AND nodeport=5432;
 \c - - - :master_port
 SELECT master_remove_node('localhost', 5432);
 
--- TRUNCATE
 \c - - - :worker_1_port
-TRUNCATE mx_table;
-SELECT count(*) FROM mx_table;
 
 -- mark_tables_colocated
 UPDATE pg_dist_partition SET colocationid = 0 WHERE logicalrelid='mx_table_2'::regclass;
@@ -168,7 +165,8 @@ DROP TABLE mx_table;
 SELECT count(*) FROM mx_table;
 
 -- master_drop_distributed_table_metadata
-SELECT master_drop_distributed_table_metadata('mx_table'::regclass, 'public', 'mx_table');
+SELECT master_remove_distributed_table_metadata_from_workers('mx_table'::regclass, 'public', 'mx_table');
+SELECT master_remove_partition_metadata('mx_table'::regclass, 'public', 'mx_table');
 SELECT count(*) FROM mx_table;
 
 -- master_copy_shard_placement

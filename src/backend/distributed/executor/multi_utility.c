@@ -36,6 +36,7 @@
 #include "distributed/colocation_utils.h"
 #include "distributed/foreign_constraint.h"
 #include "distributed/intermediate_results.h"
+#include "distributed/listutils.h"
 #include "distributed/maintenanced.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
@@ -50,6 +51,7 @@
 #include "distributed/multi_utility.h" /* IWYU pragma: keep */
 #include "distributed/pg_dist_partition.h"
 #include "distributed/policy.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
@@ -85,6 +87,9 @@
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/syscache.h"
+
+
+#define LOCK_RELATION_IF_EXISTS "SELECT lock_relation_if_exists('%s', '%s');"
 
 
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
@@ -146,6 +151,11 @@ static void ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement
 static void ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt);
 static void ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt);
 static void ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement);
+static void ProcessTruncateStatement(TruncateStmt *truncateStatement);
+static void ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command);
+static void EnsurePartitionTableNotReplicatedForTruncate(TruncateStmt *truncateStatement);
+static void LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement);
+static void AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode);
 static bool OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId);
 static void ErrorIfUnsupportedRenameStmt(RenameStmt *renameStmt);
 static void ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement);
@@ -296,6 +306,37 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		return;
 	}
 
+#if (PG_VERSION_NUM >= 110000)
+	if (IsA(parsetree, CallStmt))
+	{
+		/*
+		 * Stored procedures are a bit strange in the sense that some statements
+		 * are not in a transaction block, but can be rolled back. We need to
+		 * make sure we send all statements in a transaction block. The
+		 * StoredProcedureLevel variable signals this to the router executor
+		 * and indicates how deep in the call stack we are in case of nested
+		 * stored procedures.
+		 */
+		StoredProcedureLevel += 1;
+
+		PG_TRY();
+		{
+			standard_ProcessUtility(pstmt, queryString, context,
+									params, queryEnv, dest, completionTag);
+
+			StoredProcedureLevel -= 1;
+		}
+		PG_CATCH();
+		{
+			StoredProcedureLevel -= 1;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		return;
+	}
+#endif
+
 	/*
 	 * TRANSMIT used to be separate command, but to avoid patching the grammar
 	 * it's no overlaid onto COPY, but with FORMAT = 'transmit' instead of the
@@ -355,6 +396,7 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 	if (IsA(parsetree, TruncateStmt))
 	{
 		ErrorIfUnsupportedTruncateStmt((TruncateStmt *) parsetree);
+		ProcessTruncateStatement((TruncateStmt *) parsetree);
 	}
 
 	/* only generate worker DDLJobs if propagation is enabled */
@@ -2891,6 +2933,225 @@ ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 
 
 /*
+ * ProcessTruncateStatement handles few things that should be
+ * done before standard process utility is called for truncate
+ * command.
+ */
+static void
+ProcessTruncateStatement(TruncateStmt *truncateStatement)
+{
+	EnsurePartitionTableNotReplicatedForTruncate(truncateStatement);
+	ExecuteTruncateStmtSequentialIfNecessary(truncateStatement);
+	LockTruncatedRelationMetadataInWorkers(truncateStatement);
+}
+
+
+/*
+ * ExecuteTruncateStmtSequentialIfNecessary decides if the TRUNCATE stmt needs
+ * to run sequential. If so, it calls SetLocalMultiShardModifyModeToSequential().
+ *
+ * If a reference table which has a foreign key from a distributed table is truncated
+ * we need to execute the command sequentially to avoid self-deadlock.
+ */
+static void
+ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command)
+{
+	List *relationList = command->relations;
+	ListCell *relationCell = NULL;
+	bool failOK = false;
+
+	foreach(relationCell, relationList)
+	{
+		RangeVar *rangeVar = (RangeVar *) lfirst(relationCell);
+		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, failOK);
+
+		if (IsDistributedTable(relationId) &&
+			PartitionMethod(relationId) == DISTRIBUTE_BY_NONE &&
+			TableReferenced(relationId))
+		{
+			char *relationName = get_rel_name(relationId);
+
+			ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
+							 errdetail(
+								 "Reference relation \"%s\" is modified, which might lead "
+								 "to data inconsistencies or distributed deadlocks via "
+								 "parallel accesses to hash distributed relations due to "
+								 "foreign keys. Any parallel modification to "
+								 "those hash distributed relations in the same "
+								 "transaction can only be executed in sequential query "
+								 "execution mode", relationName)));
+
+			SetLocalMultiShardModifyModeToSequential();
+
+			/* nothing to do more */
+			return;
+		}
+	}
+}
+
+
+/*
+ * EnsurePartitionTableNotReplicatedForTruncate a simple wrapper around
+ * EnsurePartitionTableNotReplicated for TRUNCATE command.
+ */
+static void
+EnsurePartitionTableNotReplicatedForTruncate(TruncateStmt *truncateStatement)
+{
+	ListCell *relationCell = NULL;
+
+	foreach(relationCell, truncateStatement->relations)
+	{
+		RangeVar *relationRV = (RangeVar *) lfirst(relationCell);
+		Relation relation = heap_openrv(relationRV, NoLock);
+		Oid relationId = RelationGetRelid(relation);
+
+		if (!IsDistributedTable(relationId))
+		{
+			heap_close(relation, NoLock);
+			continue;
+		}
+
+		EnsurePartitionTableNotReplicated(relationId);
+
+		heap_close(relation, NoLock);
+	}
+}
+
+
+/*
+ * LockTruncatedRelationMetadataInWorkers determines if distributed
+ * lock is necessary for truncated relations, and acquire locks.
+ *
+ * LockTruncatedRelationMetadataInWorkers handles distributed locking
+ * of truncated tables before standard utility takes over.
+ *
+ * Actual distributed truncation occurs inside truncate trigger.
+ *
+ * This is only for distributed serialization of truncate commands.
+ * The function assumes that there is no foreign key relation between
+ * non-distributed and distributed relations.
+ */
+static void
+LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement)
+{
+	List *distributedRelationList = NIL;
+	ListCell *relationCell = NULL;
+
+	/* nothing to do if there is no metadata at worker nodes */
+	if (!ClusterHasKnownMetadataWorkers())
+	{
+		return;
+	}
+
+	foreach(relationCell, truncateStatement->relations)
+	{
+		RangeVar *relationRV = (RangeVar *) lfirst(relationCell);
+		Relation relation = heap_openrv(relationRV, NoLock);
+		Oid relationId = RelationGetRelid(relation);
+		DistTableCacheEntry *cacheEntry = NULL;
+		List *referencingTableList = NIL;
+		ListCell *referencingTableCell = NULL;
+
+		if (!IsDistributedTable(relationId))
+		{
+			heap_close(relation, NoLock);
+			continue;
+		}
+
+		if (list_member_oid(distributedRelationList, relationId))
+		{
+			heap_close(relation, NoLock);
+			continue;
+		}
+
+		distributedRelationList = lappend_oid(distributedRelationList, relationId);
+
+		cacheEntry = DistributedTableCacheEntry(relationId);
+		Assert(cacheEntry != NULL);
+
+		referencingTableList = cacheEntry->referencingRelationsViaForeignKey;
+		foreach(referencingTableCell, referencingTableList)
+		{
+			Oid referencingRelationId = lfirst_oid(referencingTableCell);
+			distributedRelationList = list_append_unique_oid(distributedRelationList,
+															 referencingRelationId);
+		}
+
+		heap_close(relation, NoLock);
+	}
+
+	if (distributedRelationList != NIL)
+	{
+		AcquireDistributedLockOnRelations(distributedRelationList, AccessExclusiveLock);
+	}
+}
+
+
+/*
+ * AcquireDistributedLockOnRelations acquire a distributed lock on worker nodes
+ * for given list of relations ids. Relation id list and worker node list
+ * sorted so that the lock is acquired in the same order regardless of which
+ * node it was run on. Notice that no lock is acquired on coordinator node.
+ *
+ * Notice that the locking functions is sent to all workers regardless of if
+ * it has metadata or not. This is because a worker node only knows itself
+ * and previous workers that has metadata sync turned on. The node does not
+ * know about other nodes that have metadata sync turned on afterwards.
+ */
+static void
+AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
+{
+	ListCell *relationIdCell = NULL;
+	List *workerNodeList = ActivePrimaryNodeList();
+	const char *lockModeText = LockModeToLockModeText(lockMode);
+
+	/*
+	 * We want to acquire locks in the same order accross the nodes.
+	 * Although relation ids may change, their ordering will not.
+	 */
+	relationIdList = SortList(relationIdList, CompareOids);
+	workerNodeList = SortList(workerNodeList, CompareWorkerNodes);
+
+	BeginOrContinueCoordinatedTransaction();
+
+	foreach(relationIdCell, relationIdList)
+	{
+		Oid relationId = lfirst_oid(relationIdCell);
+
+		/*
+		 * We only acquire distributed lock on relation if
+		 * the relation is sync'ed between mx nodes.
+		 */
+		if (ShouldSyncTableMetadata(relationId))
+		{
+			char *qualifiedRelationName = generate_qualified_relation_name(relationId);
+			StringInfo lockRelationCommand = makeStringInfo();
+			ListCell *workerNodeCell = NULL;
+
+			appendStringInfo(lockRelationCommand, LOCK_RELATION_IF_EXISTS,
+							 qualifiedRelationName, lockModeText);
+
+			foreach(workerNodeCell, workerNodeList)
+			{
+				WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
+				char *nodeName = workerNode->workerName;
+				int nodePort = workerNode->workerPort;
+
+				/* if local node is one of the targets, acquire the lock locally */
+				if (workerNode->groupId == GetLocalGroupId())
+				{
+					LockRelationOid(relationId, lockMode);
+					continue;
+				}
+
+				SendCommandToWorker(nodeName, nodePort, lockRelationCommand->data);
+			}
+		}
+	}
+}
+
+
+/*
  * OptionsSpecifyOwnedBy processes the options list of either a CREATE or ALTER
  * SEQUENCE command, extracting the first OWNED BY option it encounters. The
  * identifier for the specified table is placed in the Oid out parameter before
@@ -3135,7 +3396,11 @@ AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
  * in its default value of '1pc', then a notice message indicating that '2pc' might be
  * used for extra safety. In the commit protocol, a BEGIN is sent after connection to
  * each shard placement and COMMIT/ROLLBACK is handled by
- * CompleteShardPlacementTransactions function.
+ * CoordinatedTransactionCallback function.
+ *
+ * The function errors out if the node is not the coordinator or if the DDL is on
+ * a partitioned table which has replication factor > 1.
+ *
  */
 static void
 ExecuteDistributedDDLJob(DDLJob *ddlJob)
@@ -3143,6 +3408,7 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 	bool shouldSyncMetadata = ShouldSyncTableMetadata(ddlJob->targetRelationId);
 
 	EnsureCoordinator();
+	EnsurePartitionTableNotReplicated(ddlJob->targetRelationId);
 
 	if (!ddlJob->concurrentIndexCmd)
 	{
@@ -3547,7 +3813,7 @@ InterShardDDLTaskList(Oid leftRelationId, Oid rightRelationId,
  *
  * This code is heavily borrowed from RangeVarCallbackForDropRelation() in
  * commands/tablecmds.c in Postgres source. We need this to ensure the right
- * order of locking while dealing with DROP INDEX statments. Because we are
+ * order of locking while dealing with DROP INDEX statements. Because we are
  * exclusively using this callback for INDEX processing, the PARTITION-related
  * logic from PostgreSQL's similar callback has been omitted as unneeded.
  */
@@ -3558,6 +3824,7 @@ RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid, voi
 	HeapTuple	tuple;
 	struct DropRelationCallbackState *state;
 	char		relkind;
+	char		expected_relkind;
 	Form_pg_class classform;
 	LOCKMODE	heap_lockmode;
 
@@ -3588,7 +3855,21 @@ RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid, voi
 		return;					/* concurrently dropped, so nothing to do */
 	classform = (Form_pg_class) GETSTRUCT(tuple);
 
-	if (classform->relkind != relkind)
+	/*
+	 * PG 11 sends relkind as partitioned index for an index
+	 * on partitioned table. It is handled the same
+	 * as regular index as far as we are concerned here.
+	 *
+	 * See tablecmds.c:RangeVarCallbackForDropRelation()
+	 */
+	expected_relkind = classform->relkind;
+
+#if PG_VERSION_NUM >= 110000
+	if (expected_relkind == RELKIND_PARTITIONED_INDEX)
+		expected_relkind = RELKIND_INDEX;
+#endif
+
+	if (expected_relkind != relkind)
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						errmsg("\"%s\" is not an index", rel->relname)));
 

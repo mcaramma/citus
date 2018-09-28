@@ -28,6 +28,7 @@
 #include "distributed/multi_master_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/recursive_planning.h"
+#include "distributed/shardinterval_utils.h"
 #include "distributed/worker_shard_visibility.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
@@ -61,6 +62,8 @@ static DistributedPlan * CreateDistributedPlan(uint64 planId, Query *originalQue
 											   bool hasUnresolvedParams,
 											   PlannerRestrictionContext *
 											   plannerRestrictionContext);
+static DeferredErrorMessage * DeferErrorIfPartitionTableNotSingleReplicated(Oid
+																			relationId);
 static Node * ResolveExternalParams(Node *inputNode, ParamListInfo boundParams);
 
 static void AssignRTEIdentities(Query *queryTree);
@@ -134,7 +137,7 @@ distributed_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	 * Make sure that we hide shard names on the Citus MX worker nodes. See comments in
 	 * ReplaceTableVisibleFunction() for the details.
 	 */
-	parse = (Query *) ReplaceTableVisibleFunction((Node *) parse);
+	ReplaceTableVisibleFunction((Node *) parse);
 
 	/* create a restriction context and put it at the end if context list */
 	plannerRestrictionContext = CreateAndPushPlannerRestrictionContext();
@@ -584,10 +587,24 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 
 	if (IsModifyCommand(originalQuery))
 	{
+		Oid targetRelationId = InvalidOid;
 		EnsureModificationsCanRun();
+
+		targetRelationId = ModifyQueryResultRelationId(query);
+		EnsurePartitionTableNotReplicated(targetRelationId);
 
 		if (InsertSelectIntoDistributedTable(originalQuery))
 		{
+			if (hasUnresolvedParams)
+			{
+				/*
+				 * Unresolved parameters can cause performance regressions in
+				 * INSERT...SELECT when the partition column is a parameter
+				 * because we don't perform any additional pruning in the executor.
+				 */
+				return NULL;
+			}
+
 			distributedPlan =
 				CreateInsertSelectPlan(originalQuery, plannerRestrictionContext);
 		}
@@ -761,6 +778,53 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 	Assert(distributedPlan && distributedPlan->planningError == NULL);
 
 	return distributedPlan;
+}
+
+
+/*
+ * EnsurePartitionTableNotReplicated errors out if the infput relation is
+ * a partition table and the table has a replication factor greater than
+ * one.
+ *
+ * If the table is not a partition or replication factor is 1, the function
+ * becomes a no-op.
+ */
+void
+EnsurePartitionTableNotReplicated(Oid relationId)
+{
+	DeferredErrorMessage *deferredError =
+		DeferErrorIfPartitionTableNotSingleReplicated(relationId);
+	if (deferredError != NULL)
+	{
+		RaiseDeferredError(deferredError, ERROR);
+	}
+}
+
+
+/*
+ * DeferErrorIfPartitionTableNotSingleReplicated defers error if the input relation
+ * is a partition table with replication factor > 1. Otherwise, the function returns
+ * NULL.
+ */
+static DeferredErrorMessage *
+DeferErrorIfPartitionTableNotSingleReplicated(Oid relationId)
+{
+	if (PartitionTableNoLock(relationId) && !SingleReplicatedTable(relationId))
+	{
+		Oid parentOid = PartitionParentOid(relationId);
+		char *parentRelationTest = get_rel_name(parentOid);
+		StringInfo errorHint = makeStringInfo();
+
+		appendStringInfo(errorHint, "Run the query on the parent table "
+									"\"%s\" instead.", parentRelationTest);
+
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "modifications on partitions when replication "
+							 "factor is greater than 1 is not supported",
+							 NULL, errorHint->data);
+	}
+
+	return NULL;
 }
 
 

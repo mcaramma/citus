@@ -37,6 +37,7 @@
 /* following functions are renamed in PG11 */
 #define PreventInTransactionBlock PreventTransactionChain
 #define DatumGetJsonbP(d) DatumGetJsonb(d)
+#define RequireTransactionBlock RequireTransactionChain
 
 /* following defines also exist for PG11 */
 #define RELATION_OBJECT_TYPE ACL_OBJECT_RELATION
@@ -153,6 +154,7 @@ canonicalize_qual_compat(Expr *qual, bool is_check)
 #define ACLCHECK_OBJECT_SCHEMA OBJECT_SCHEMA
 #define ACLCHECK_OBJECT_INDEX OBJECT_INDEX
 
+#define ConstraintRelidIndexId ConstraintRelidTypidNameIndexId
 
 static inline void
 ExplainPropertyIntegerInternal(const char *qlabel, const char *unit, int64 value,

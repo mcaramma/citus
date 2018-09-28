@@ -19,8 +19,7 @@
 #include "libpq-fe.h"
 #include "miscadmin.h"
 
-#include "access/xact.h"
-#include "catalog/namespace.h"
+
 #include "catalog/pg_class.h"
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
@@ -31,18 +30,22 @@
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/multi_shard_transaction.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shard_pruning.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/worker_transaction.h"
 #include "optimizer/clauses.h"
 #include "optimizer/predtest.h"
 #include "optimizer/restrictinfo.h"
@@ -58,7 +61,6 @@
 
 static List * ModifyMultipleShardsTaskList(Query *query, List *shardIntervalList, TaskType
 										   taskType);
-static bool ShouldExecuteTruncateStmtSequential(TruncateStmt *command);
 
 
 PG_FUNCTION_INFO_V1(master_modify_multiple_shards);
@@ -89,6 +91,7 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 	int32 affectedTupleCount = 0;
 	CmdType operation = CMD_UNKNOWN;
 	TaskType taskType = TASK_TYPE_INVALID_FIRST;
+	bool truncateOperation = false;
 #if (PG_VERSION_NUM >= 100000)
 	RawStmt *rawStmt = (RawStmt *) ParseTreeRawStmt(queryString);
 	queryTreeNode = rawStmt->stmt;
@@ -96,9 +99,13 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 	queryTreeNode = ParseTreeNode(queryString);
 #endif
 
-	EnsureCoordinator();
 	CheckCitusVersion(ERROR);
 
+	truncateOperation = IsA(queryTreeNode, TruncateStmt);
+	if (!truncateOperation)
+	{
+		EnsureCoordinator();
+	}
 
 	if (IsA(queryTreeNode, DeleteStmt))
 	{
@@ -136,11 +143,6 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 		}
 
 		EnsureTablePermissions(relationId, ACL_TRUNCATE);
-
-		if (ShouldExecuteTruncateStmtSequential(truncateStatement))
-		{
-			SetLocalMultiShardModifyModeToSequential();
-		}
 	}
 	else
 	{
@@ -249,35 +251,4 @@ ModifyMultipleShardsTaskList(Query *query, List *shardIntervalList, TaskType tas
 	}
 
 	return taskList;
-}
-
-
-/*
- * ShouldExecuteTruncateStmtSequential decides if the TRUNCATE stmt needs
- * to run sequential. If so, it calls SetLocalMultiShardModifyModeToSequential().
- *
- * If a reference table which has a foreign key from a distributed table is truncated
- * we need to execute the command sequentially to avoid self-deadlock.
- */
-static bool
-ShouldExecuteTruncateStmtSequential(TruncateStmt *command)
-{
-	List *relationList = command->relations;
-	ListCell *relationCell = NULL;
-	bool failOK = false;
-
-	foreach(relationCell, relationList)
-	{
-		RangeVar *rangeVar = (RangeVar *) lfirst(relationCell);
-		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, failOK);
-
-		if (IsDistributedTable(relationId) &&
-			PartitionMethod(relationId) == DISTRIBUTE_BY_NONE &&
-			TableReferenced(relationId))
-		{
-			return true;
-		}
-	}
-
-	return false;
 }

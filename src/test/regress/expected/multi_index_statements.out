@@ -3,6 +3,13 @@
 --
 -- Check that we can run CREATE INDEX and DROP INDEX statements on distributed
 -- tables.
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int AS major_version;
+ major_version 
+---------------
+            11
+(1 row)
+
 --
 -- CREATE TEST TABLES
 --
@@ -71,6 +78,7 @@ CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash(a);
 CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash(a,b);
 CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON index_test_hash(a,b) WHERE c IS NOT NULL;
 CREATE UNIQUE INDEX index_test_range_index_a_b_partial ON index_test_range(a,b) WHERE c IS NOT NULL;
+CREATE UNIQUE INDEX index_test_hash_index_a_b_c ON index_test_hash(a) INCLUDE (b,c);
 RESET client_min_messages;
 -- Verify that we handle if not exists statements correctly
 CREATE INDEX lineitem_orderkey_index on lineitem(l_orderkey);
@@ -102,6 +110,7 @@ SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_t
 ------------+------------------+------------------------------------+------------+----------------------------------------------------------------------------------------------------------------------------
  public     | index_test_hash  | index_test_hash_index_a            |            | CREATE UNIQUE INDEX index_test_hash_index_a ON public.index_test_hash USING btree (a)
  public     | index_test_hash  | index_test_hash_index_a_b          |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON public.index_test_hash USING btree (a, b)
+ public     | index_test_hash  | index_test_hash_index_a_b_c        |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c ON public.index_test_hash USING btree (a) INCLUDE (b, c)
  public     | index_test_hash  | index_test_hash_index_a_b_partial  |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON public.index_test_hash USING btree (a, b) WHERE (c IS NOT NULL)
  public     | index_test_range | index_test_range_index_a           |            | CREATE UNIQUE INDEX index_test_range_index_a ON public.index_test_range USING btree (a)
  public     | index_test_range | index_test_range_index_a_b         |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON public.index_test_range USING btree (a, b)
@@ -115,7 +124,7 @@ SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_t
  public     | lineitem         | lineitem_partkey_desc_index        |            | CREATE INDEX lineitem_partkey_desc_index ON public.lineitem USING btree (l_partkey DESC)
  public     | lineitem         | lineitem_pkey                      |            | CREATE UNIQUE INDEX lineitem_pkey ON public.lineitem USING btree (l_orderkey, l_linenumber)
  public     | lineitem         | lineitem_time_index                |            | CREATE INDEX lineitem_time_index ON public.lineitem USING btree (l_shipdate)
-(15 rows)
+(16 rows)
 
 \c - - - :worker_1_port
 SELECT count(*) FROM pg_indexes WHERE tablename = (SELECT relname FROM pg_class WHERE relname LIKE 'lineitem%' ORDER BY relname LIMIT 1);
@@ -127,7 +136,7 @@ SELECT count(*) FROM pg_indexes WHERE tablename = (SELECT relname FROM pg_class 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_hash%';
  count 
 -------
-    24
+    32
 (1 row)
 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_range%';
@@ -179,6 +188,7 @@ SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_t
 ------------+------------------+------------------------------------+------------+----------------------------------------------------------------------------------------------------------------------------
  public     | index_test_hash  | index_test_hash_index_a            |            | CREATE UNIQUE INDEX index_test_hash_index_a ON public.index_test_hash USING btree (a)
  public     | index_test_hash  | index_test_hash_index_a_b          |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON public.index_test_hash USING btree (a, b)
+ public     | index_test_hash  | index_test_hash_index_a_b_c        |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c ON public.index_test_hash USING btree (a) INCLUDE (b, c)
  public     | index_test_hash  | index_test_hash_index_a_b_partial  |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON public.index_test_hash USING btree (a, b) WHERE (c IS NOT NULL)
  public     | index_test_range | index_test_range_index_a           |            | CREATE UNIQUE INDEX index_test_range_index_a ON public.index_test_range USING btree (a)
  public     | index_test_range | index_test_range_index_a_b         |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON public.index_test_range USING btree (a, b)
@@ -192,7 +202,7 @@ SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_t
  public     | lineitem         | lineitem_partkey_desc_index        |            | CREATE INDEX lineitem_partkey_desc_index ON public.lineitem USING btree (l_partkey DESC)
  public     | lineitem         | lineitem_pkey                      |            | CREATE UNIQUE INDEX lineitem_pkey ON public.lineitem USING btree (l_orderkey, l_linenumber)
  public     | lineitem         | lineitem_time_index                |            | CREATE INDEX lineitem_time_index ON public.lineitem USING btree (l_shipdate)
-(15 rows)
+(16 rows)
 
 --
 -- DROP INDEX
@@ -231,9 +241,10 @@ SELECT indrelid::regclass, indexrelid::regclass FROM pg_index WHERE indrelid = (
 (0 rows)
 
 SELECT * FROM pg_indexes WHERE tablename LIKE 'index_test_%' ORDER BY indexname;
- schemaname | tablename | indexname | tablespace | indexdef 
-------------+-----------+-----------+------------+----------
-(0 rows)
+ schemaname |    tablename    |          indexname          | tablespace |                                                 indexdef                                                 
+------------+-----------------+-----------------------------+------------+----------------------------------------------------------------------------------------------------------
+ public     | index_test_hash | index_test_hash_index_a_b_c |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c ON public.index_test_hash USING btree (a) INCLUDE (b, c)
+(1 row)
 
 \c - - - :worker_1_port
 SELECT indrelid::regclass, indexrelid::regclass FROM pg_index WHERE indrelid = (SELECT relname FROM pg_class WHERE relname LIKE 'lineitem%' ORDER BY relname LIMIT 1)::regclass AND NOT indisprimary AND indexrelid::regclass::text NOT LIKE 'lineitem_time_index%';
@@ -242,9 +253,17 @@ SELECT indrelid::regclass, indexrelid::regclass FROM pg_index WHERE indrelid = (
 (0 rows)
 
 SELECT * FROM pg_indexes WHERE tablename LIKE 'index_test_%' ORDER BY indexname;
- schemaname | tablename | indexname | tablespace | indexdef 
-------------+-----------+-----------+------------+----------
-(0 rows)
+ schemaname |       tablename        |             indexname              | tablespace |                                                        indexdef                                                        
+------------+------------------------+------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------
+ public     | index_test_hash_102082 | index_test_hash_index_a_b_c_102082 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102082 ON public.index_test_hash_102082 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102083 | index_test_hash_index_a_b_c_102083 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102083 ON public.index_test_hash_102083 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102084 | index_test_hash_index_a_b_c_102084 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102084 ON public.index_test_hash_102084 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102085 | index_test_hash_index_a_b_c_102085 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102085 ON public.index_test_hash_102085 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102086 | index_test_hash_index_a_b_c_102086 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102086 ON public.index_test_hash_102086 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102087 | index_test_hash_index_a_b_c_102087 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102087 ON public.index_test_hash_102087 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102088 | index_test_hash_index_a_b_c_102088 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102088 ON public.index_test_hash_102088 USING btree (a) INCLUDE (b, c)
+ public     | index_test_hash_102089 | index_test_hash_index_a_b_c_102089 |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_c_102089 ON public.index_test_hash_102089 USING btree (a) INCLUDE (b, c)
+(8 rows)
 
 -- create index that will conflict with master operations
 CREATE INDEX CONCURRENTLY ith_b_idx_102089 ON index_test_hash_102089(b);
